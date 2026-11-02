@@ -1,0 +1,99 @@
+# Authored for the sealed build: upstream spring-cloud-commons 2.1.x has no
+# GitHub Actions CI (only .circleci/config.yml). This mirrors the CircleCI
+# "Running build" step (./mvnw clean install --batch-mode
+# -Dmaven.test.redirectTestOutputToFile=true) on JDK 8 with the project's own
+# Maven 3.5.0 wrapper, scoped to the spring-cloud-context module and the
+# reactor modules it depends on.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      _JAVA_OPTIONS: "-Xms1024m -Xmx2048m"
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Use Maven Central only
+        # .mvn/maven.config activates -P spring (repo.spring.io repositories,
+        # which now require authentication); every dependency of this release
+        # is on Maven Central. CircleCI's -s .settings.xml / -P sonar (jacoco +
+        # codecov upload) are likewise left out.
+        run: ": > .mvn/maven.config"
+
+      - name: Build and test spring-cloud-context
+        run: |
+          set -o pipefail
+          FLAGS="--batch-mode -e -nsu -Dmaven.test.redirectTestOutputToFile=true -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -Ddisable.checks=true -Dcheckstyle.skip=true -Dspring-javaformat.skip=true -Dmaven.javadoc.skip=true -Dgpg.skip=true"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw $FLAGS clean install -pl spring-cloud-context -am -Dtest="${{ inputs.test-filter }}" -DfailIfNoTests=false
+          else
+            ./mvnw $FLAGS clean install -pl spring-cloud-context -am
+          fi
+
+      - name: Surefire test report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, re, xml.etree.ElementTree as ET
+
+          def source_reason(mod, cls, name):
+              # Surefire records no message for a JUnit 4 @Ignore without a
+              # value; print the annotation line from the test source instead.
+              path = f"{mod}/src/test/java/" + cls.replace(".", "/") + ".java"
+              try:
+                  lines = open(path, encoding="utf-8").read().splitlines()
+              except OSError:
+                  return None
+              for i, line in enumerate(lines):
+                  if re.search(r"\bvoid\s+" + re.escape(name) + r"\s*\(", line):
+                      for j in range(i - 1, max(-1, i - 7), -1):
+                          if re.search(r"@(Ignore|Disabled)\b", lines[j]):
+                              return f"source annotation in {path}:{j + 1}: {lines[j].strip()}"
+                      break
+              for line in lines:
+                  if re.match(r"\s*@(Ignore|Disabled)\b", line):
+                      return f"class-level annotation in {path}: {line.strip()}"
+              return None
+
+          totals = {}
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              mod = f.split("/target/")[0]
+              root = ET.parse(f).getroot()
+              t = totals.setdefault(mod, [0, 0, 0, 0])
+              t[0] += int(root.get("tests", 0)); t[1] += int(root.get("failures", 0))
+              t[2] += int(root.get("errors", 0)); t[3] += int(root.get("skipped", 0))
+              for tc in root.iter("testcase"):
+                  sk = tc.find("skipped")
+                  if sk is not None:
+                      reason = sk.get("message") or source_reason(mod, tc.get("classname"), tc.get("name")) or "NO REASON FOUND"
+                      print(f"SKIPPED {tc.get('classname')}.{tc.get('name')}: {reason}")
+          gt = [0, 0, 0, 0]
+          for mod, (n, fl, er, sk) in totals.items():
+              print(f"MODULE {mod}: tests={n} failures={fl} errors={er} skipped={sk} passed={n-fl-er-sk}")
+              gt = [a + b for a, b in zip(gt, (n, fl, er, sk))]
+          n, fl, er, sk = gt
+          print(f"TOTAL: tests={n} failures={fl} errors={er} skipped={sk} passed={n-fl-er-sk}")
+          EOF
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-cloud-context-jar
+          path: spring-cloud-context/target/spring-cloud-context-2.1.6.RELEASE.jar
+          if-no-files-found: error
